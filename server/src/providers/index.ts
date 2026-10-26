@@ -13,14 +13,19 @@
 
 import type { HookProvider } from '../../../core/src/provider.js';
 import { claudeProvider } from './hook/claude/claude.js';
+import { museProvider } from './hook/muse/muse.js';
 
 export { claudeProvider };
 export { copyHookScript } from './hook/claude/claudeHookInstaller.js';
+export { museProvider };
+export { copyHookScript as copyMuseHookScript } from './hook/muse/museHookInstaller.js';
+export type { MuseSessionBridgeHost } from './hook/muse/museSessionBridge.js';
+export { startMuseSessionBridge } from './hook/muse/museSessionBridge.js';
 
 /** Every bundled hook provider, in registration order. The consent gate loops
  *  over this at the webviewReady handshake (one ask per provider that needs
  *  one) and `hooksConsentResponse` resolves its provider id against it. */
-export const hookProviders: readonly HookProvider[] = [claudeProvider];
+export const hookProviders: readonly HookProvider[] = [claudeProvider, museProvider];
 
 /** Resolve a wire-supplied provider id, or undefined for an unknown one —
  *  the caller writes nothing on undefined (fail-closed, like a junk choice). */
