@@ -34,6 +34,27 @@ The architecture is fully agent-agnostic and editor-agnostic: a typed `HookProvi
 
 ![Pixel Agents screenshot](webview-ui/public/office.png)
 
+## Muse version (this fork)
+
+This fork of [pixel-agents-hq/pixel-agents](https://github.com/pixel-agents-hq/pixel-agents) (MIT License, see [LICENSE](LICENSE)) adds a second agent provider: **Muse**, Meta's terminal coding agent (`muse` CLI). The Claude Code provider is unchanged — both run side by side, and a Muse session seats a character exactly like a Claude Code session does: it walks to a desk, types during tool activity, and leaves when the session ends.
+
+**How detection works** (two channels, in priority order):
+
+1. **Native hooks (primary).** Muse's hook system is wire-compatible with Claude Code's — same `hooks` shape in `~/.config/muse/settings.json`, same JSON payloads on stdin. On first run the office asks for consent (the same gate as the Claude provider), then installs a `muse-hook.js` script that POSTs each event to `/api/hooks/muse` on the local server. Installed events: `SessionStart`, `SessionEnd`, `Stop`, `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`. (Deliberately not installed: `UserPromptSubmit`, which nothing consumes, and `SubagentStart`/`SubagentStop`, which Muse fires for its internal reminder subagents.) Verified empirically against Muse v1.4.13.
+2. **Session bridge (fallback).** A scanner tails the transcripts Muse always writes — `~/.local/share/muse/sessions/<YYYY>/<MM>/<DD>/<session-id>/session.jsonl` — and translates new records (`runtime.session.metadata`, `tool_batch.effect.*`, `approval_wait.*`, `session.end`) into the same hook events. It stays silent while the native hooks deliver, and takes over a session only when hooks are absent or demonstrably failing, so a session is never shown twice.
+
+Under the hood: `AgentRuntime` now routes hook events to a per-provider `HookEventHandler` (all handlers share one store, one `SessionRouter`, and one set of lifecycle callbacks), and the standalone CLI tracks its own working directory so cwd-adopted sessions pass the tracked-project gate.
+
+**Run it** (standalone, from the project directory you want watched):
+
+```sh
+npm install && npm run build
+cd /path/to/your/project
+node /path/to/pixel-agents-muse/dist/cli.js --port 3100
+```
+
+Then open `http://127.0.0.1:3100`. The fork uses the same `~/.pixel-agents/` data directory as upstream (layout, config, token), so an existing office — rooms, areas, pets — carries over unchanged.
+
 ## Features
 
 - **One agent, one character** — every Claude Code terminal gets its own animated character
