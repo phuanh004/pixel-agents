@@ -32,7 +32,14 @@ import {
   WILDCARD_HOSTNAMES,
 } from './constants.js';
 import { FileStateAdapter } from './fileStateAdapter.js';
-import { claudeProvider, copyHookScript, hookProviderById } from './providers/index.js';
+import {
+  claudeProvider,
+  copyHookScript,
+  copyMuseHookScript,
+  hookProviderById,
+  museProvider,
+  startMuseSessionBridge,
+} from './providers/index.js';
 import { PixelAgentsServer } from './server.js';
 import { PtySessionManager } from './terminal/ptySessionManager.js';
 import { isLoopbackHost, normalizeHostname } from './wsAuth.js';
@@ -145,6 +152,25 @@ function copyHookScriptOrReport(packageRoot: string, context = ''): boolean {
   return false;
 }
 
+function copyMuseHookScriptOrReport(packageRoot: string, context = ''): boolean {
+  if (copyMuseHookScript(packageRoot)) return true;
+  console.error(`[Pixel Agents] Muse hooks NOT installed${context}: hook script missing.`);
+  return false;
+}
+
+/** Copy the named provider's bundled hook script before its settings entries
+ *  are installed. Each provider's script is its own: copying (or failing to
+ *  copy) one provider's script must never install or block another's. */
+function copyProviderHookScriptOrReport(
+  providerId: string,
+  packageRoot: string,
+  context = '',
+): boolean {
+  if (providerId === claudeProvider.id) return copyHookScriptOrReport(packageRoot, context);
+  if (providerId === museProvider.id) return copyMuseHookScriptOrReport(packageRoot, context);
+  return true;
+}
+
 // ── Terminal status reporting ─────────────────────────────────
 
 /**
@@ -244,7 +270,8 @@ async function main(): Promise<void> {
 
   try {
     // Create runtime first (before server.start, so we can pass it in)
-    const runtime = new AgentRuntime(store, claudeProvider);
+    const runtime = new AgentRuntime(store, claudeProvider, [museProvider]);
+    let museBridge: { stop(): void } | null = null;
 
     // Wire hook events: HTTP POST -> runtime -> hookEventHandler -> agents
     server.onHookEvent((providerId, event) => {
@@ -265,10 +292,7 @@ async function main(): Promise<void> {
         // to the Claude provider alone; another provider's install must
         // neither copy it nor be blocked by it.
         grantHooksConsent(provider.id);
-        if (
-          provider.id === claudeProvider.id &&
-          !copyHookScriptOrReport(packageRoot, ' (user toggle)')
-        ) {
+        if (!copyProviderHookScriptOrReport(provider.id, packageRoot, ' (user toggle)')) {
           return;
         }
         try {
@@ -352,9 +376,11 @@ async function main(): Promise<void> {
     reportTerminalStatus(ptyManager, args.host, args.terminal);
 
     // Sync runtime refs with persisted settings BEFORE first scan tick. The
-    // runtime's single hooksEnabled ref follows the Claude provider until the
-    // scanners grow per-provider awareness alongside the Settings UI.
-    runtime.hooksEnabled.current = getHooksEnabled(claudeProvider.id);
+    // runtime's single hooksEnabled ref is on when ANY provider's hooks are
+    // enabled (it gates the heuristic scanners, which stay Claude-shaped;
+    // Muse sessions arrive via hooks or the muse session bridge instead).
+    runtime.hooksEnabled.current =
+      getHooksEnabled(claudeProvider.id) || getHooksEnabled(museProvider.id);
     runtime.watchAllSessions.current = adapter.getSetting('pixel-agents.watchAllSessions', false);
 
     // Install hooks on startup if the persisted setting says so — gated on the
@@ -393,6 +419,25 @@ async function main(): Promise<void> {
       );
     }
 
+    // Muse provider startup install — same consent gate as Claude's, but no
+    // silent-grant migration: the provider is new, so nothing of ours can
+    // already be sitting in ~/.config/muse/settings.json from a pre-consent
+    // version. A fresh install waits for the in-UI approval.
+    if (getHooksEnabled(museProvider.id)) {
+      if (getHooksConsent(museProvider.id) !== 'granted') {
+        console.log(
+          '[Pixel Agents] Muse hooks not installed — approve the Muse hooks prompt in the UI (Settings → Instant Detection) to enable live Muse sessions.',
+        );
+      } else if (copyMuseHookScriptOrReport(packageRoot)) {
+        try {
+          await museProvider.installHooks(`http://127.0.0.1:${config.port}`, config.token);
+          console.log('[Pixel Agents] Muse hooks installed');
+        } catch (err) {
+          console.error(`[Pixel Agents] ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
     // Start scanning for external sessions (Claude running in user's terminal)
     const cwd = process.cwd();
     const dirs = claudeProvider.getSessionDirs?.(cwd);
@@ -403,6 +448,28 @@ async function main(): Promise<void> {
       runtime.startExternalScanning(projectDir);
       runtime.startStaleCheck();
     }
+
+    // Track the workspace root itself, not just the Claude session dir.
+    // Hook-adopted sessions are gated on their project dir, and a provider
+    // whose transcripts live outside the project (Muse:
+    // ~/.local/share/muse/sessions/...) is adopted by its cwd — the very
+    // directory this server was started from. Without this registration that
+    // session reads as "untracked" and is refused. The scan itself is
+    // harmless here: it seeds *.jsonl files in the directory, and a project
+    // root does not keep session transcripts at its top level.
+    runtime.startProjectScan(cwd);
+
+    // Muse session bridge: seats Muse sessions from their session
+    // transcripts when the native hooks are not installed, and takes over a
+    // session whose hooks are installed but never deliver (see
+    // museSessionBridge.ts for the takeover rule).
+    museBridge = startMuseSessionBridge(
+      {
+        emit: (event) => runtime.handleHookEvent(museProvider.id, event),
+        hasAgentForSession: (sessionId) => runtime.hasAgentWithSession(sessionId),
+      },
+      { fallbackCwd: cwd },
+    );
 
     // The URL the operator opens has to be REACHABLE (a wildcard bind address
     // is a bind target, not an address you can browse to — `--host 0.0.0.0`
@@ -427,6 +494,7 @@ async function main(): Promise<void> {
       // wait for them: exiting now would cancel the SIGKILL escalation and
       // leave a child that ignores SIGHUP orphaned on a dead server.
       await ptyManager.disposeAll();
+      museBridge?.stop();
       runtime.dispose();
       server.stop();
       process.exit(0);

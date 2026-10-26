@@ -39,27 +39,25 @@ function copyAssets() {
  * Produces a self-contained CJS file with shebang for Claude Code to execute.
  */
 function buildHooks() {
-  const entry = path.join(
-    __dirname,
-    'server',
-    'src',
-    'providers',
-    'hook',
-    'claude',
-    'hooks',
-    'claude-hook.ts',
-  );
-  if (!fs.existsSync(entry)) return;
-  require('esbuild').buildSync({
-    entryPoints: [entry],
-    bundle: true,
-    platform: 'node',
-    target: 'node18',
-    format: 'cjs',
-    outdir: path.join(__dirname, 'dist', 'hooks'),
-    banner: { js: '#!/usr/bin/env node' },
-  });
-  console.log('✓ Built hooks/ → dist/hooks/');
+  const entries = [
+    path.join(__dirname, 'server', 'src', 'providers', 'hook', 'claude', 'hooks', 'claude-hook.ts'),
+    path.join(__dirname, 'server', 'src', 'providers', 'hook', 'muse', 'hooks', 'muse-hook.ts'),
+  ].filter((entry) => fs.existsSync(entry));
+  // One build per entry, not one build for all: esbuild mirrors the entry
+  // directory structure under outdir for multi-entry builds, but the hook
+  // installers copy from the FLAT dist/hooks/<name>.js paths.
+  for (const entry of entries) {
+    require('esbuild').buildSync({
+      entryPoints: [entry],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      format: 'cjs',
+      outdir: path.join(__dirname, 'dist', 'hooks'),
+      banner: { js: '#!/usr/bin/env node' },
+    });
+  }
+  if (entries.length > 0) console.log('✓ Built hooks/ → dist/hooks/');
 }
 
 /**
