@@ -30,7 +30,7 @@ export interface HookEvent {
  * suppresses heuristic timers (permission 7s, text-idle 5s) for that agent.
  */
 /** Callback for session lifecycle events detected via hooks. */
-interface SessionLifecycleCallbacks {
+export interface SessionLifecycleCallbacks {
   /** Called when an external session is detected (unknown session_id in SessionStart).
    *  transcriptPath is undefined for providers without transcripts (OpenCode, Copilot). */
   onExternalSessionDetected?: (
@@ -58,6 +58,16 @@ interface SessionLifecycleCallbacks {
 
 export class HookEventHandler {
   private lifecycleCallbacks: SessionLifecycleCallbacks = {};
+
+  /** Optional re-dispatch hook for buffered-event flushes. When several
+   *  providers share one SessionRouter (multi-provider runtimes), a flush
+   *  triggered through THIS handler can surface events that belong to
+   *  ANOTHER provider; the runtime sets this so flushed events re-enter
+   *  through the router and land on the owning provider's handler instead
+   *  of being normalized with this handler's provider. Unset in
+   *  single-provider runtimes, where flushing through `handleEvent`
+   *  directly is exactly right. */
+  dispatchEvent?: (providerId: string, event: HookEvent) => void;
 
   /** Highest HookProvider.protocolVersion this handler understands. */
   private static readonly SUPPORTED_PROTOCOL_VERSION = 1;
@@ -114,7 +124,11 @@ export class HookEventHandler {
         `[Pixel Agents] Hook: flushing ${flushed.length} buffered event(s) for session ${sessionId.slice(0, 8)}...`,
       );
     for (const { providerId, event } of flushed) {
-      this.handleEvent(providerId, event as HookEvent);
+      if (this.dispatchEvent) {
+        this.dispatchEvent(providerId, event as HookEvent);
+      } else {
+        this.handleEvent(providerId, event as HookEvent);
+      }
     }
   }
 

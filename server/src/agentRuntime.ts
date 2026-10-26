@@ -34,7 +34,7 @@ import {
   startFileWatching,
   startStaleExternalAgentCheck,
 } from './fileWatcher.js';
-import type { HookEvent } from './hookEventHandler.js';
+import type { HookEvent, SessionLifecycleCallbacks } from './hookEventHandler.js';
 import { HookEventHandler } from './hookEventHandler.js';
 import { assignPaletteIfNeeded } from './paletteAssigner.js';
 import { PathSet, pathsMatch } from './pathKey.js';
@@ -83,11 +83,16 @@ export class AgentRuntime {
   /** Shadow-store watcher for unnamed background spawns (sub-agents). */
   readonly subagentWatch: SubagentWatch;
   private hookEventHandler: HookEventHandler;
+  /** All hook handlers by provider id (primary + additional providers).
+   *  Handlers share the store, timers, SessionRouter and lifecycle
+   *  callbacks; only normalization is per-provider. */
+  private readonly hookHandlers = new Map<string, HookEventHandler>();
   private lifecycleCallbacks: RuntimeLifecycleCallbacks = {};
 
   constructor(
     private readonly store: AgentStateStore,
     provider: HookProvider,
+    additionalProviders: readonly HookProvider[] = [],
   ) {
     // Wire module-level dependencies
     setDismissalTracker(this.dismissalTracker);
@@ -142,17 +147,43 @@ export class AgentRuntime {
       }
     });
 
+    // One SessionRouter shared by every provider's handler: session→agent
+    // routing is provider-agnostic, and a shared router lets any handler's
+    // registerAgent flush another provider's buffered events (they re-enter
+    // through handleHookEvent via dispatchEvent, so each event is still
+    // normalized by its OWN provider).
+    const sessionRouter = new SessionRouter();
     this.hookEventHandler = new HookEventHandler(
       store,
       this.waitingTimers,
       this.permissionTimers,
       provider,
-      new SessionRouter(),
+      sessionRouter,
       this.watchAllSessions,
     );
+    this.hookHandlers.set(provider.id, this.hookEventHandler);
+    for (const extra of additionalProviders) {
+      const handler = new HookEventHandler(
+        store,
+        this.waitingTimers,
+        this.permissionTimers,
+        extra,
+        sessionRouter,
+        this.watchAllSessions,
+      );
+      this.hookHandlers.set(extra.id, handler);
+    }
+    for (const handler of this.hookHandlers.values()) {
+      handler.dispatchEvent = (providerId, event) =>
+        this.handleHookEvent(providerId, event as unknown as Record<string, unknown>);
+    }
 
-    // Wire hook lifecycle callbacks to shared agent operations
-    this.hookEventHandler.setLifecycleCallbacks({
+    // Wire hook lifecycle callbacks to shared agent operations (the same
+    // callbacks serve every provider's handler; provider-specific branches
+    // inside, like the team check, read the PRIMARY provider and are skipped
+    // for providers without that surface — Muse events carry no
+    // transcriptPath, so the team branch never engages for them).
+    const lifecycleCallbacks: SessionLifecycleCallbacks = {
       onExternalSessionDetected: (sessionId, transcriptPath, cwd) => {
         const projectDir = transcriptPath ? path.dirname(transcriptPath) : cwd;
         // Teammate session of a tracked lead? Attach it as a teammate character
@@ -277,7 +308,10 @@ export class AgentRuntime {
           this.removeAgent(agentId);
         }
       },
-    });
+    };
+    for (const handler of this.hookHandlers.values()) {
+      handler.setLifecycleCallbacks(lifecycleCallbacks);
+    }
   }
 
   /** Register adapter-specific lifecycle callbacks. */
@@ -287,9 +321,23 @@ export class AgentRuntime {
 
   // ── Hook event routing ──
 
-  /** Route an incoming hook event to the appropriate agent. */
+  /** Route an incoming hook event to the appropriate agent. Events are
+   *  dispatched to the handler of the provider that sent them (each handler
+   *  normalizes with its own provider); an unknown provider id falls back to
+   *  the primary handler, matching the historical single-provider behavior. */
   handleHookEvent(providerId: string, event: Record<string, unknown>): void {
-    this.hookEventHandler.handleEvent(providerId, event as HookEvent);
+    const handler = this.hookHandlers.get(providerId) ?? this.hookEventHandler;
+    handler.handleEvent(providerId, event as HookEvent);
+  }
+
+  /** Whether any agent in the store belongs to this session id. Used by
+   *  session-scanning bridges to tell whether the native hook channel has
+   *  already seated a session before taking it over. */
+  hasAgentWithSession(sessionId: string): boolean {
+    for (const agent of this.store.values()) {
+      if (agent.sessionId === sessionId) return true;
+    }
+    return false;
   }
 
   /** Register an agent with the hook event handler for session->agent mapping. */
@@ -556,7 +604,9 @@ export class AgentRuntime {
 
   /** Clean up all scanners, timers, and agents. Called on shutdown. */
   dispose(): void {
-    this.hookEventHandler.dispose();
+    for (const handler of this.hookHandlers.values()) {
+      handler.dispose();
+    }
     this.subagentWatch.dispose();
 
     if (this.projectScanTimer.current) {
